@@ -1,0 +1,979 @@
+#!/bin/bash
+#==============================================================================
+# docmost-setup - deploy Docmost with Docker Compose, backups included.
+#
+# Postgres, Redis and the app in one compose file; secrets asked when it runs
+# or taken from the environment, SMTP optional. Backups go to the folder you
+# choose, a NAS mount included, as often as you choose, with rotation, and
+# come back with --restore. Run it again to change any of that.
+#
+#   docmost-setup                  interactive install or reconfigure
+#   docmost-setup --status         read only
+#   docmost-setup --backup         dump the database and the uploads now
+#   docmost-setup --restore        put the latest backup back
+#   docmost-setup --update         back up, then pull newer images
+#
+# https://github.com/Lousblue/docmost-setup                        MIT licence
+#==============================================================================
+set -Eeuo pipefail
+
+APP_DIR='/opt/docmost'
+UNIT='docmost-backup'
+DEFAULT_PORT=3000
+DEFAULT_BACKUP_DIR='/var/backups/docmost'
+DEFAULT_KEEP=8
+DEFAULT_EVERY='daily'
+DEFAULT_TIME='03:30'
+IMAGE='docmost/docmost:latest'   # postgres:16-alpine and redis:7.2-alpine sit beside it, see the compose file
+
+#--- Output -------------------------------------------------------------------
+if [ -t 1 ]; then
+  TTY=1
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  C=$'\033[36m'; G=$'\033[32m'; Y=$'\033[33m'; E=$'\033[31m'
+else
+  TTY=0
+  R=; B=; D=; C=; G=; Y=; E=
+fi
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# Blocks: System, Questions, To apply, Done.
+title() { printf '\n%s%s%s\n' "$B" "$1" "$R"; }
+kv()    { printf '  %-13s %s\n' "$1" "$2"; }
+note()  { printf '  %s%s%s\n' "$D" "$1" "$R"; }
+warn()  { printf '  %s!%s %s\n' "$Y" "$R" "$1" >&2; }
+die()   { printf '%serror:%s %s\n' "$E" "$R" "$1" >&2; exit 1; }
+
+# Steps: a framed box per step, with a running log.
+STEP=0; TOTAL=0; WARNINGS=0; CURRENT=''
+LOG=''
+log()   { [ -n "$LOG" ] && printf '%s\n' "$1" >>"$LOG"; return 0; }
+step()  { STEP=$((STEP + 1)); CURRENT="$1"
+          printf '\n%s┌─ [%d/%d] %s%s  %s%s%s\n' "$C" "$STEP" "$TOTAL" "$1" "$R" "$D" "$(date +%H:%M:%S)" "$R"
+          log ""; log "=== [$STEP/$TOTAL] $1  $(date '+%F %T')"; }
+info()  { printf '%s│%s  %s\n' "$C" "$R" "$1"; log "    $1"; }
+flag()  { printf '%s│%s  %s!%s %s\n' "$C" "$R" "$Y" "$R" "$1"; log "    WARNING $1"; WARNINGS=$((WARNINGS + 1)); }
+ok()    { printf '%s└─%s %s✓%s %s\n' "$C" "$R" "$G" "$R" "$1"; log "    OK $1"; }
+stop()  { printf '%s└─%s %s!%s %s\n' "$C" "$R" "$Y" "$R" "$1"; log "    WARNING $1"; WARNINGS=$((WARNINGS + 1)); }
+fail()  { printf '%s└─ ✗ %s%s\n' "$E" "$1" "$R" >&2; log "    FAILED $1"; exit 1; }
+
+plural()   { if [ "$1" = 1 ]; then echo "1 $2"; else echo "$1 ${3:-${2}s}"; fi; }
+duration() { if [ "$1" -ge 60 ]; then echo "$(($1 / 60)) min $(($1 % 60)) s"; else echo "$1 s"; fi; }
+hsize()    { du -h "$1" 2>/dev/null | cut -f1; }
+
+# Runs a command with its output in the log and a spinner on the terminal.
+busy() {   # busy <label> <command...>
+  local label="$1" pid i=0; shift
+  if [ "$TTY" = 0 ]; then "$@" >>"$LOG" 2>&1; return; fi
+  "$@" >>"$LOG" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r\033[K%s│%s  %s%s%s %s' "$C" "$R" "$C" "${SPIN[i]}" "$R" "$label"
+    i=$(( (i + 1) % ${#SPIN[@]} )); sleep 0.1
+  done
+  printf '\r\033[K'
+  wait "$pid"
+}
+# Same, for a job already started in the background (its output goes elsewhere).
+busy_wait() {   # busy_wait <label> <pid>
+  local label="$1" pid="$2" i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$TTY" = 1 ]; then
+      printf '\r\033[K%s│%s  %s%s%s %s' "$C" "$R" "$C" "${SPIN[i]}" "$R" "$label"
+    fi
+    i=$(( (i + 1) % ${#SPIN[@]} )); sleep 0.1
+  done
+  [ "$TTY" = 1 ] && printf '\r\033[K'
+  wait "$pid"
+}
+
+#--- Help ---------------------------------------------------------------------
+usage() {
+  cat <<EOF
+docmost-setup - deploy Docmost with Docker Compose, backups included.
+
+usage: docmost-setup [settings]
+       docmost-setup --status | --backup | --update | --cron | --uncron
+       docmost-setup --restore [WHEN] [--from DIR] [--yes]
+
+  Run with no options on a terminal and it asks what it needs, showing what
+  it found. Run it again to change anything: the values in place are the
+  defaults. Pass any setting and it applies without asking; what you did not
+  mention keeps its value from $APP_DIR/.env, or takes the built-in default.
+
+settings
+  --url URL            public address, e.g. https://docs.example.com  (required)
+  --port N             port published on this machine        (default: $DEFAULT_PORT)
+  --backup-dir PATH    where backups go, a NAS mount included (default: $DEFAULT_BACKUP_DIR)
+  --keep N             backups kept in the Old folder        (default: $DEFAULT_KEEP)
+  --every WHEN         how often the backup runs by itself: never, hourly,
+                       2h 3h 4h 6h 8h 12h, daily, weekly      (default: $DEFAULT_EVERY)
+  --at HH:MM           time of day, for daily and weekly      (default: $DEFAULT_TIME)
+  --restore-latest     on a fresh install, restore the newest backup found in
+                       the backup folder once Docmost is up
+  --smtp-host HOST     send mail through this server; without it, mails go to the log
+  --smtp-port N        (default: 587)
+  --smtp-user NAME
+  --smtp-from ADDRESS  sender address
+  --smtp-name NAME     sender name                            (default: Docmost)
+  --smtp-secure        implicit TLS, usually port 465
+
+secrets, from the environment or asked with the input hidden
+  APP_SECRET           signs sessions; generated when left empty
+  DB_PASSWORD          Postgres password; generated when left empty
+  SMTP_USERNAME, SMTP_PASSWORD
+
+other
+  --status             show the stack, the backups and the schedule, change nothing
+  --backup             dump the database and the uploads to the backup folder
+  --restore [WHEN]     put a backup back: the newest, or one by date (2026-09-01)
+                       or by date and time (2026-09-01-0330)
+  --from DIR           with --restore, look in this folder instead of the usual one
+  --update             back up, then pull newer images and recreate the containers
+  --cron, --uncron     install the timer again from the saved schedule, or remove it
+  --dry-run            show what would be done, then stop
+  --yes, -y            never ask
+  --help, -h           this text
+EOF
+}
+
+#--- Arguments ----------------------------------------------------------------
+MODE='install'
+ASSUME_YES=0
+DRY_RUN=0
+GIVEN=0
+APP_URL=''
+PORT=''
+BACKUP_DIR=''
+KEEP=''
+EVERY=''
+BACKUP_TIME=''
+RESTORE_LATEST=no
+RESTORE_WHEN=''
+RESTORE_FROM=''
+SMTP_HOST=''; SMTP_PORT=''; SMTP_USER=''; SMTP_FROM=''; SMTP_NAME=''; SMTP_SECURE=''
+ME="${SUDO_USER:-$(id -un)}"
+
+need_arg() { [ -n "${2:-}" ] || die "$1 needs a value"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status)         MODE='status' ;;
+    --backup)         MODE='backup' ;;
+    --cron)           MODE='cron' ;;
+    --uncron)         MODE='uncron' ;;
+    --restore)        MODE='restore' ;;
+    --update)         MODE='update' ;;
+    --help|-h)        usage; exit 0 ;;
+    --yes|-y)         ASSUME_YES=1 ;;
+    --dry-run)        DRY_RUN=1 ;;
+    --from)           need_arg "$@"; RESTORE_FROM="$2"; shift ;;
+    --url)            need_arg "$@"; APP_URL="$2";     GIVEN=1; shift ;;
+    --port)           need_arg "$@"; PORT="$2";        GIVEN=1; shift ;;
+    --backup-dir)     need_arg "$@"; BACKUP_DIR="$2";  GIVEN=1; shift ;;
+    --keep)           need_arg "$@"; KEEP="$2";        GIVEN=1; shift ;;
+    --every)          need_arg "$@"; EVERY="$2";       GIVEN=1; shift ;;
+    --at)             need_arg "$@"; BACKUP_TIME="$2"; GIVEN=1; shift ;;
+    --no-cron)        EVERY='never';                   GIVEN=1 ;;
+    --restore-latest) RESTORE_LATEST=yes;              GIVEN=1 ;;
+    --smtp-host)      need_arg "$@"; SMTP_HOST="$2";   GIVEN=1; shift ;;
+    --smtp-port)      need_arg "$@"; SMTP_PORT="$2";   GIVEN=1; shift ;;
+    --smtp-user)      need_arg "$@"; SMTP_USER="$2";   GIVEN=1; shift ;;
+    --smtp-from)      need_arg "$@"; SMTP_FROM="$2";   GIVEN=1; shift ;;
+    --smtp-name)      need_arg "$@"; SMTP_NAME="$2";   GIVEN=1; shift ;;
+    --smtp-secure)    SMTP_SECURE=true;                GIVEN=1 ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*) RESTORE_WHEN="$1" ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+valid_url()   { [[ "$1" =~ ^https?://[^[:space:]/]+ ]]; }
+valid_port()  { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+valid_count() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+valid_time()  { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+valid_when()  { [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9]{4})?$ ]]; }
+# A number of hours must divide the day, so runs fall at the same times daily.
+valid_every() { case "$1" in never|hourly|daily|weekly|2h|3h|4h|6h|8h|12h) return 0 ;; *) return 1 ;; esac; }
+
+[ -z "$RESTORE_WHEN" ] || [ "$MODE" = restore ] || die 'a date only goes with --restore'
+[ -z "$RESTORE_FROM" ] || [ "$MODE" = restore ] || die '--from only goes with --restore'
+[ -z "$RESTORE_WHEN" ] || valid_when  "$RESTORE_WHEN" || die "a backup is named by date, 2026-09-01, or date and time, 2026-09-01-0330; got '$RESTORE_WHEN'"
+[ -z "$APP_URL" ]      || valid_url   "$APP_URL"      || die "--url must start with http:// or https://, got '$APP_URL'"
+[ -z "$PORT" ]         || valid_port  "$PORT"         || die "--port wants a number from 1 to 65535, got '$PORT'"
+[ -z "$KEEP" ]         || valid_count "$KEEP"         || die "--keep wants a whole number above zero, got '$KEEP'"
+[ -z "$EVERY" ]        || valid_every "$EVERY"        || die "--every wants never, hourly, 2h 3h 4h 6h 8h 12h, daily or weekly; got '$EVERY'"
+[ -z "$BACKUP_TIME" ]  || valid_time  "$BACKUP_TIME"  || die "--at wants HH:MM, got '$BACKUP_TIME'"
+[ -z "$SMTP_PORT" ]    || valid_port  "$SMTP_PORT"    || die "--smtp-port wants a port number, got '$SMTP_PORT'"
+[ -z "$BACKUP_DIR" ]   || case "$BACKUP_DIR" in /*) ;; *) die '--backup-dir must be an absolute path' ;; esac
+[ -z "$RESTORE_FROM" ] || case "$RESTORE_FROM" in /*) ;; *) die '--from must be an absolute path' ;; esac
+
+#--- Privileges and docker ----------------------------------------------------
+if [ "$(id -u)" = 0 ]; then SUDO=''
+elif command -v sudo >/dev/null; then SUDO='sudo'
+else SUDO=''; fi
+can_sudo() { [ "$(id -u)" = 0 ] || [ -n "$SUDO" ]; }
+command -v docker >/dev/null 2>&1 || die 'docker is not installed - see https://github.com/Lousblue/docker-setup'
+if docker info >/dev/null 2>&1; then DOCKER='docker'
+elif [ -n "$SUDO" ] && $SUDO -n docker info >/dev/null 2>&1; then DOCKER="$SUDO docker"
+elif [ -n "$SUDO" ] && [ -t 0 ] && $SUDO docker info >/dev/null 2>&1; then DOCKER="$SUDO docker"
+else die 'docker does not answer - is the service running, and are you in the docker group?'; fi
+$DOCKER compose version >/dev/null 2>&1 || die 'the docker compose plugin is missing'
+compose() { ( cd "$APP_DIR" && $DOCKER compose "$@" ); }
+
+#--- What is already there ----------------------------------------------------
+ENVF="$APP_DIR/.env"
+COMPOSE="$APP_DIR/docker-compose.yml"
+env_get() { [ -r "$ENVF" ] || return 0; sed -n "s/^$1=//p" "$ENVF" | head -1; }
+env_set() { sed -i "/^$1=/d" "$ENVF"; echo "$1=$2" >>"$ENVF"; }
+INSTALLED=0; [ -f "$COMPOSE" ] && [ -f "$ENVF" ] && INSTALLED=1
+
+# Settings remembered in .env from the last run, so --backup, --restore and
+# the timer know where to go without being told again.
+CUR_URL="$(env_get APP_URL)"
+CUR_PORT="$(env_get PORT)"
+CUR_BACKUP_DIR="$(env_get BACKUP_DIR)"
+CUR_KEEP="$(env_get BACKUP_KEEP)"
+CUR_EVERY="$(env_get BACKUP_EVERY)"
+CUR_TIME="$(env_get BACKUP_TIME)"
+CUR_MOUNT="$(env_get BACKUP_MOUNT)"
+CUR_SMTP_HOST="$(env_get SMTP_HOST)"
+timer_on() { systemctl is-enabled "$UNIT.timer" >/dev/null 2>&1; }
+# A machine set up before this setting existed: a timer means daily.
+if [ -z "$CUR_EVERY" ] && timer_on; then CUR_EVERY='daily'; fi
+
+ctn_state() { local s; s="$($DOCKER inspect --format '{{.State.Status}}' "$1" 2>/dev/null | head -1 || true)"; echo "${s:-absent}"; }
+pg_ready()  { $DOCKER exec -i docmost-db pg_isready -U docmost >/dev/null 2>&1; }
+http_code() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${1:-$DEFAULT_PORT}" 2>/dev/null || true; }
+wait_http() {   # up to a minute for the app to answer
+  local _ code=''
+  for _ in $(seq 1 30); do
+    code="$(http_code "$1")"
+    case "$code" in 200|301|302|307|308) echo "$code"; return 0 ;; esac
+    sleep 2
+  done
+  echo "${code:-none}"; return 1
+}
+
+# Backups are prod-STAMP.sql plus docmost-prod-data-STAMP.tgz, where STAMP is
+# YYYY-MM-DD-HHMM, so sorting by name is sorting by time. find, not ls: no
+# error when there are none.
+list_dumps()  { find "$1" -maxdepth 1 -name 'prod-*.sql' 2>/dev/null | sort || true; }
+count_dumps() { list_dumps "$1" | wc -l | tr -d ' '; }
+latest_dump() { list_dumps "$1" | tail -1; }
+stamp_of()    { local d; d="$(basename "$1" .sql)"; echo "${d#prod-}"; }
+
+# The mount point a folder lives on when that is a network share, else nothing.
+# A backup written to the empty folder under an unmounted share would land on
+# the local disk and look like a success: this is what lets --backup refuse.
+net_mount_of() {
+  local p="$1" t='' f=''
+  while [ ! -e "$p" ] && [ "$p" != / ]; do p="$(dirname "$p")"; done
+  read -r t f < <(findmnt -n -o TARGET,FSTYPE -T "$p" 2>/dev/null) || true
+  case "$f" in cifs|smb3|nfs|nfs4|fuse.sshfs) echo "$t" ;; esac
+}
+place_text() { local m; m="$(net_mount_of "$1")"; if [ -n "$m" ]; then echo "on the network share mounted at $m"; else echo 'on the local disk'; fi; }
+# A path under /mnt or /media that turns out to be local usually means a share
+# that is not mounted right now.
+looks_unmounted() { [ -z "$(net_mount_of "$1")" ] && case "$1" in /mnt/*|/media/*) return 0 ;; *) return 1 ;; esac; }
+
+# Schedule, in words and in systemd's OnCalendar syntax.
+every_text() {   # every_text <every> <time>
+  case "$1" in
+    never|'') echo 'never, only when you run --backup' ;;
+    hourly)   echo 'every hour' ;;
+    daily)    echo "every day at $2" ;;
+    weekly)   echo "every week, Sunday at $2" ;;
+    *h)       echo "every ${1%h} hours" ;;
+  esac
+}
+on_calendar() {
+  case "$1" in
+    hourly) echo '*-*-* *:00:00' ;;
+    daily)  echo "*-*-* $2:00" ;;
+    weekly) echo "Sun *-*-* $2:00" ;;
+    *h)     echo "*-*-* 00/${1%h}:00:00" ;;
+  esac
+}
+
+show_system() {
+  local url port bdir keep last
+  title 'System'
+  kv docker "$(docker --version 2>/dev/null | sed 's/^Docker version \([^,]*\),.*/\1/'), compose $($DOCKER compose version --short 2>/dev/null)"
+  if [ "$INSTALLED" = 0 ]; then
+    kv docmost 'not installed'
+    return 0
+  fi
+  url="${CUR_URL:-unknown}"; port="${CUR_PORT:-$DEFAULT_PORT}"
+  kv docmost "$(ctn_state docmost), postgres $(ctn_state docmost-db), redis $(ctn_state docmost-redis)"
+  if [ "$(ctn_state docmost-db)" = running ]; then
+    if pg_ready; then kv database 'answering'; else kv database 'not answering'; fi
+  fi
+  kv url "$url, port $port on this machine, http $(http_code "$port")"
+  if [ -n "$CUR_SMTP_HOST" ]; then kv mail "smtp via $CUR_SMTP_HOST"; else kv mail 'none, written to the log'; fi
+  bdir="${CUR_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}"; keep="${CUR_KEEP:-$DEFAULT_KEEP}"
+  if [ -n "$CUR_MOUNT" ] && ! mountpoint -q "$CUR_MOUNT" 2>/dev/null; then
+    kv backups "$bdir - $CUR_MOUNT IS NOT MOUNTED, backups will fail"
+  elif [ -d "$bdir" ]; then
+    last="$(latest_dump "$bdir")"
+    if [ -n "$last" ]; then kv backups "$bdir, $(place_text "$bdir")"; kv '' "latest $(stamp_of "$last"), $(count_dumps "$bdir/Old") kept in Old, cap $keep"
+    else kv backups "$bdir, $(place_text "$bdir"), none yet"; fi
+  else
+    kv backups "$bdir, folder missing"
+  fi
+  if timer_on; then
+    kv schedule "$(every_text "${CUR_EVERY:-daily}" "${CUR_TIME:-$DEFAULT_TIME}"), next $(systemctl show "$UNIT.timer" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)"
+  else
+    kv schedule 'none, only when you run --backup'
+  fi
+  return 0
+}
+
+start_log() {
+  # The install folder belongs to the user, so the timer can write here too.
+  if [ ! -d "$APP_DIR" ]; then $SUDO mkdir -p "$APP_DIR"; $SUDO chown "$ME" "$APP_DIR"; fi
+  LOG="$APP_DIR/docmost-setup.log"
+  touch "$LOG" 2>/dev/null || LOG="/tmp/docmost-setup.log"
+  log ""; log "##### docmost-setup $MODE $(date '+%F %T')"
+}
+on_error() {
+  local c=$?
+  [ "$TTY" = 1 ] && printf '\r\033[K'
+  printf '%s└─ ✗ %s failed (exit %d)%s\n' "$E" "$CURRENT" "$c" "$R" >&2
+  if [ -n "$LOG" ]; then
+    printf '   last lines of %s:\n' "$LOG" >&2
+    tail -n 12 "$LOG" 2>/dev/null | sed 's/^/     /' >&2
+  fi
+  rm -f "${SQL:-}" "${TGZ:-}" "${SQL:-}.part" "${TGZ:-}.part" 2>/dev/null
+  [ "${RESTORING:-0}" = 1 ] && printf '   docmost may be stopped: docker start docmost\n' >&2
+  exit "$c"
+}
+arm() { trap on_error ERR; }
+finish() {
+  trap - ERR; set +e
+  printf '\n%s' "$C"; printf '─%.0s' $(seq 1 62); printf '%s\n' "$R"
+  printf '%sDone%s in %s, %s\n' "$B" "$R" "$(duration "$SECONDS")" "$(plural "$WARNINGS" warning)"
+}
+
+#--- Backup, five steps, shared by --backup and --update ----------------------
+do_backup() {   # do_backup <folder> <keep> <recorded network mount, or empty>
+  local bdir="$1" keep="$2" mnt="$3" stamp sql tgz moved=0 purged=0 f d x sfx excess b s1 s2
+  stamp="$(date +%F-%H%M)"
+  sql="$APP_DIR/prod-$stamp.sql"; tgz="$APP_DIR/docmost-prod-data-$stamp.tgz"
+  SQL="$sql"; TGZ="$tgz"; BACKUP_STAMP="$stamp"
+
+  step 'Backup checks'
+  if [ -n "$mnt" ] && ! mountpoint -q "$mnt" 2>/dev/null; then
+    fail "$mnt is not mounted - the backup would land on the local disk instead of the share; mount it, then run again"
+  fi
+  mkdir -p "$bdir" 2>/dev/null || true
+  [ -d "$bdir" ] || fail "$bdir does not exist and could not be created"
+  [ -w "$bdir" ] || fail "$bdir is not writable"
+  info "folder $bdir, $(place_text "$bdir")"
+  [ "$(ctn_state docmost-db)" = running ] || fail 'the postgres container is not running'
+  [ "$(ctn_state docmost)" = running ]    || fail 'the docmost container is not running'
+  pg_ready || fail 'postgres does not answer'
+  ok 'containers up, postgres answering'
+
+  step 'Database dump'
+  $DOCKER exec -i docmost-db pg_dump -U docmost -d docmost >"$sql.part" 2>>"$LOG" &
+  busy_wait 'pg_dump' $!
+  mv "$sql.part" "$sql"
+  head -c 200 "$sql" | grep -q 'PostgreSQL database dump' || fail 'the dump does not look like a PostgreSQL dump'
+  ok "$(basename "$sql"), $(hsize "$sql")"
+
+  step 'Uploads archive'
+  $DOCKER exec -u 0 docmost tar czf - -C /app/data/storage . >"$tgz.part" 2>>"$LOG" &
+  busy_wait 'compressing /app/data/storage' $!
+  mv "$tgz.part" "$tgz"
+  gzip -t "$tgz" 2>>"$LOG" || fail 'the archive is corrupt'
+  ok "$(basename "$tgz"), $(hsize "$tgz")"
+
+  # The newest pair sits at the root of the folder, older ones move to Old,
+  # and Old is capped: a scheduled backup would otherwise grow without limit.
+  step 'Rotation'
+  if [ "$(count_dumps "$bdir")" -gt 0 ]; then
+    mkdir -p "$bdir/Old"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      d="$(stamp_of "$f")"
+      # One suffix for the pair, so a dump and its archive never drift apart.
+      sfx=''
+      if [ -e "$bdir/Old/prod-$d.sql" ] || [ -e "$bdir/Old/docmost-prod-data-$d.tgz" ]; then sfx="-$(date +%S%N | cut -c1-6)"; fi
+      for x in prod docmost-prod-data; do
+        case "$x" in prod) b="prod-$d.sql"; s1="prod-$d$sfx.sql" ;; *) b="docmost-prod-data-$d.tgz"; s1="docmost-prod-data-$d$sfx.tgz" ;; esac
+        [ -f "$bdir/$b" ] && mv -f "$bdir/$b" "$bdir/Old/$s1"
+      done
+      moved=$((moved + 1))
+    done < <(list_dumps "$bdir")
+    info "$(plural "$moved" backup) moved to Old"
+  fi
+  if [ -d "$bdir/Old" ]; then
+    excess="$(list_dumps "$bdir/Old" | sort -r | tail -n +$((keep + 1)) || true)"
+    if [ -n "$excess" ]; then
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        d="$(stamp_of "$f")"
+        rm -f "$bdir/Old/prod-$d.sql" "$bdir/Old/docmost-prod-data-$d.tgz"
+        purged=$((purged + 1))
+      done <<<"$excess"
+      info "$(plural "$purged" backup) beyond the cap of $keep removed from Old"
+    fi
+    ok "Old keeps $(count_dumps "$bdir/Old") of $keep, $(hsize "$bdir/Old")"
+  else
+    ok 'nothing older to rotate'
+  fi
+
+  step 'Copy to the backup folder'
+  for f in "$sql" "$tgz"; do
+    b="$(basename "$f")"
+    cp "$f" "$bdir/$b.part" 2>>"$LOG" &
+    busy_wait "$b" $!
+    mv "$bdir/$b.part" "$bdir/$b"
+    s1="$(stat -c %s "$f")"; s2="$(stat -c %s "$bdir/$b")"
+    [ "$s1" = "$s2" ] || fail "$b: copied size differs ($s1 vs $s2 bytes)"
+    info "$b verified, $s2 bytes"
+  done
+  rm -f "$sql" "$tgz"
+  ok "backup $stamp in $bdir"
+}
+
+#--- Restore, shared by --restore and a fresh install with --restore-latest ---
+do_restore() {   # do_restore <folder> <when, or empty for the newest> <port> <confirm: ask|yes>
+  local bdir="$1" when="$2" port="$3" confirm="$4" f d t rsql='' rtgz answer code l _
+  RESTORING=1
+
+  step 'Backup to restore'
+  [ -d "$bdir" ] || fail "$bdir does not exist"
+  # Root and Old together, newest first whichever folder it sits in.
+  mapfile -t DUMPS < <( { list_dumps "$bdir"; list_dumps "$bdir/Old"; } \
+                        | awk -F/ 'NF { print $NF "\t" $0 }' | sort -r | cut -f2)
+  [ "${#DUMPS[@]}" -gt 0 ] || fail "no prod-*.sql in $bdir or $bdir/Old"
+  info "looking in $bdir, $(place_text "$bdir")"
+  for f in "${DUMPS[@]}"; do
+    d="$(stamp_of "$f")"
+    if [ -f "$(dirname "$f")/docmost-prod-data-$d.tgz" ]; then t='with uploads'; else t='WITHOUT uploads'; fi
+    case "$f" in */Old/*) t="$t, in Old" ;; esac
+    info "$d  $(hsize "$f")  $t"
+    # The list is newest first, so the first match of a date is that day's last.
+    if [ -z "$rsql" ]; then case "$d" in "$when"*) rsql="$f" ;; esac; fi
+  done
+  [ -n "$rsql" ] || fail "no backup matches $when"
+  RESTORED="$(stamp_of "$rsql")"
+  rtgz="$(dirname "$rsql")/docmost-prod-data-$RESTORED.tgz"
+  [ -f "$rtgz" ] || flag "no uploads archive for $RESTORED - files will not be restored"
+  ok "$RESTORED"
+
+  if [ "$confirm" = ask ]; then
+    step 'Confirmation'
+    [ -t 0 ] || fail 'no terminal to confirm on - run again with --yes'
+    printf '%s│%s  %sThe current database and uploads will be REPLACED by %s. Type YES to go on:%s ' "$C" "$R" "$Y" "$RESTORED" "$R"
+    read -r answer || answer=''
+    [ "$answer" = YES ] || { printf '%s└─%s cancelled, nothing changed\n' "$C" "$R"; exit 0; }
+    ok 'confirmed'
+  fi
+
+  step 'Database'
+  [ "$(ctn_state docmost-db)" = running ] || fail 'the postgres container is not running'
+  [ "$(ctn_state docmost)" = running ]    || fail 'the docmost container is not running'
+  pg_ready || fail 'postgres does not answer'
+  $DOCKER stop docmost >/dev/null
+  info 'docmost stopped'
+  $DOCKER exec -i docmost-db psql -q -v ON_ERROR_STOP=1 -U docmost -d docmost \
+    -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;' >>"$LOG" 2>&1
+  info 'schema emptied'
+  $DOCKER exec -i docmost-db psql -q -v ON_ERROR_STOP=1 -U docmost -d docmost <"$rsql" >>"$LOG" 2>&1 &
+  busy_wait "importing $(basename "$rsql")" $!
+  ok 'dump imported without errors'
+
+  step 'Uploads'
+  $DOCKER start docmost >/dev/null
+  for _ in $(seq 1 20); do $DOCKER exec docmost true >/dev/null 2>&1 && break; sleep 0.5; done
+  if [ -f "$rtgz" ]; then
+    $DOCKER exec -u 0 docmost sh -c 'mkdir -p /app/data/storage && find /app/data/storage -mindepth 1 -delete'
+    $DOCKER exec -i -u 0 docmost tar xzf - -C /app/data/storage <"$rtgz" 2>>"$LOG" &
+    busy_wait "extracting $(basename "$rtgz")" $!
+    $DOCKER exec -u 0 docmost chown -R node:node /app/data/storage
+    ok 'files restored'
+  else
+    stop 'no archive, files left as they were'
+  fi
+  $DOCKER restart docmost >/dev/null
+
+  step 'Restore check'
+  for _ in $(seq 1 30); do pg_ready && break; sleep 1; done
+  while IFS= read -r l; do info "$l"; done < <(
+    $DOCKER exec -i docmost-db psql -At -U docmost -d docmost \
+      -c "SELECT 'users        '||COUNT(*) FROM users;" \
+      -c "SELECT 'spaces       '||COUNT(*) FROM spaces;" \
+      -c "SELECT 'pages        '||COUNT(*) FROM pages;" \
+      -c "SELECT 'attachments  '||COUNT(*) FROM attachments;" 2>/dev/null || echo 'counts unavailable'
+  )
+  info "files        $($DOCKER exec -u 0 docmost sh -c 'find /app/data/storage -type f | wc -l' 2>/dev/null || echo '?')"
+  code="$(wait_http "$port" || true)"
+  case "$code" in 200|301|302|307|308) ok "restored $RESTORED, http $code on port $port" ;; *) stop "restored $RESTORED, but http $code on port $port - docker logs docmost" ;; esac
+  RESTORING=0
+}
+
+#--- The timer, shared by the install and --cron ------------------------------
+# A systemd timer rather than a crontab line: its state can be queried, its
+# output lands in the journal, and a run missed because the machine was off is
+# caught up at the next boot.
+install_timer() {   # install_timer <every> <time> <folder>
+  local every="$1" at="$2" bdir="$3" self mnt req=''
+  self="$(readlink -f "$0")"
+  mnt="$(net_mount_of "$bdir")"
+  # On a network share, the job waits for that mount and fails loudly without it.
+  [ -n "$mnt" ] && req="RequiresMountsFor=$bdir"
+  $SUDO tee "/etc/systemd/system/$UNIT.service" >/dev/null <<EOF
+[Unit]
+Description=Docmost backup
+After=docker.service
+Requires=docker.service
+$req
+
+[Service]
+Type=oneshot
+ExecStart=$self --backup
+User=$ME
+EOF
+  $SUDO tee "/etc/systemd/system/$UNIT.timer" >/dev/null <<EOF
+[Unit]
+Description=Docmost backup, $(every_text "$every" "$at")
+
+[Timer]
+OnCalendar=$(on_calendar "$every" "$at")
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable "$UNIT.timer" >>"$LOG" 2>&1
+  $SUDO systemctl restart "$UNIT.timer" >>"$LOG" 2>&1
+  info "$self --backup, as $ME"
+  info "$(every_text "$every" "$at"), up to 5 min later; a run missed while the machine was off happens at the next boot"
+  [ -n "$mnt" ] && info "waits for $mnt to be mounted"
+  ok "next: $(systemctl show "$UNIT.timer" -p NextElapseUSecRealtime --value 2>/dev/null || echo 'to be confirmed')"
+}
+remove_timer() {
+  if timer_on; then
+    $SUDO systemctl disable --now "$UNIT.timer" >>"$LOG" 2>&1
+    info 'timer stopped and disabled'
+  else
+    info 'no timer was active'
+  fi
+  $SUDO rm -f "/etc/systemd/system/$UNIT.timer" "/etc/systemd/system/$UNIT.service"
+  $SUDO systemctl daemon-reload
+  ok 'schedule removed, existing backups untouched'
+}
+
+#==============================================================================
+# Read-only and maintenance modes
+#==============================================================================
+case "$MODE" in
+  status)
+    show_system; echo; exit 0 ;;
+
+  backup)
+    [ "$INSTALLED" = 1 ] || die "nothing in $APP_DIR - run docmost-setup first"
+    start_log; arm; TOTAL=5
+    do_backup "${CUR_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}" "${CUR_KEEP:-$DEFAULT_KEEP}" "$CUR_MOUNT"
+    finish
+    kv restore "docmost-setup --restore $BACKUP_STAMP"
+    kv log "$LOG"; echo; exit 0 ;;
+
+  cron)
+    [ "$INSTALLED" = 1 ] || die "nothing in $APP_DIR - run docmost-setup first"
+    can_sudo || die 'installing a timer needs sudo'
+    every="${EVERY:-${CUR_EVERY:-$DEFAULT_EVERY}}"; at="${BACKUP_TIME:-${CUR_TIME:-$DEFAULT_TIME}}"
+    [ "$every" != never ] || die 'the saved schedule is "never" - pick one: docmost-setup --cron --every daily'
+    start_log; arm; TOTAL=1
+    step 'Automatic backup'
+    install_timer "$every" "$at" "${CUR_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}"
+    env_set BACKUP_EVERY "$every"; env_set BACKUP_TIME "$at"
+    finish; kv journal "journalctl -u $UNIT.service"; echo; exit 0 ;;
+
+  uncron)
+    can_sudo || die 'removing the timer needs sudo'
+    start_log; arm; TOTAL=1
+    step 'Automatic backup'
+    remove_timer
+    [ "$INSTALLED" = 1 ] && env_set BACKUP_EVERY never
+    finish; echo; exit 0 ;;
+
+  restore)
+    [ "$INSTALLED" = 1 ] || die "nothing in $APP_DIR - run docmost-setup first"
+    start_log; arm
+    confirm=ask; TOTAL=5
+    if [ "$ASSUME_YES" = 1 ]; then confirm=yes; TOTAL=4; fi
+    do_restore "${RESTORE_FROM:-${CUR_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}}" "$RESTORE_WHEN" "${CUR_PORT:-$DEFAULT_PORT}" "$confirm"
+    finish; kv url "${CUR_URL:-http://$(hostname -I | awk '{print $1}'):${CUR_PORT:-$DEFAULT_PORT}}"; kv log "$LOG"; echo; exit 0 ;;
+
+  update)
+    [ "$INSTALLED" = 1 ] || die "nothing in $APP_DIR - run docmost-setup first"
+    start_log; arm; TOTAL=7
+    port="${CUR_PORT:-$DEFAULT_PORT}"
+    # A backup first, every time: a new version may migrate the database
+    # schema, and there is no way back from that without a dump.
+    do_backup "${CUR_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}" "${CUR_KEEP:-$DEFAULT_KEEP}" "$CUR_MOUNT"
+
+    step 'Images'
+    before="$($DOCKER image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null | cut -c8-19 || true)"
+    busy 'pulling' compose pull
+    after="$($DOCKER image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null | cut -c8-19 || true)"
+    if [ "$before" = "$after" ]; then info "docmost image unchanged, $after"; else info "docmost image $before -> $after"; fi
+    busy 'recreating the containers' compose up -d --remove-orphans
+    # shellcheck disable=SC2086  # DOCKER may be "sudo docker", two words on purpose
+    busy 'removing old images' $DOCKER image prune -f
+    ok 'containers running on the current images'
+
+    step 'Check'
+    for _ in $(seq 1 30); do pg_ready && break; sleep 1; done
+    [ "$(ctn_state docmost)" = running ] || fail 'docmost did not start - docker compose logs docmost'
+    code="$(wait_http "$port" || true)"
+    case "$code" in 200|301|302|307|308) ok "http $code on port $port" ;; *) stop "http $code on port $port - docker compose logs docmost" ;; esac
+    finish; kv 'roll back' "docmost-setup --restore $BACKUP_STAMP"; kv log "$LOG"; echo; exit 0 ;;
+esac
+
+#==============================================================================
+# Install or reconfigure
+#==============================================================================
+show_system
+
+# Defaults: what is in .env from last time, else the built-in ones.
+APP_URL="${APP_URL:-$CUR_URL}"
+PORT="${PORT:-${CUR_PORT:-$DEFAULT_PORT}}"
+BACKUP_DIR="${BACKUP_DIR:-${CUR_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}}"
+KEEP="${KEEP:-${CUR_KEEP:-$DEFAULT_KEEP}}"
+EVERY="${EVERY:-${CUR_EVERY:-$DEFAULT_EVERY}}"
+BACKUP_TIME="${BACKUP_TIME:-${CUR_TIME:-$DEFAULT_TIME}}"
+SMTP_HOST="${SMTP_HOST:-$CUR_SMTP_HOST}"
+SMTP_PORT="${SMTP_PORT:-$(env_get SMTP_PORT)}"; SMTP_PORT="${SMTP_PORT:-587}"
+SMTP_USER="${SMTP_USER:-${SMTP_USERNAME:-$(env_get SMTP_USERNAME)}}"
+SMTP_FROM="${SMTP_FROM:-$(env_get MAIL_FROM_ADDRESS)}"
+SMTP_NAME="${SMTP_NAME:-$(env_get MAIL_FROM_NAME)}"; SMTP_NAME="${SMTP_NAME:-Docmost}"
+SMTP_SECURE="${SMTP_SECURE:-$(env_get SMTP_SECURE)}"; SMTP_SECURE="${SMTP_SECURE:-false}"
+# Secrets: the environment first, then what is already in .env. The Postgres
+# password in particular must not change once the database exists.
+APP_SECRET="${APP_SECRET:-$(env_get APP_SECRET)}"
+DB_PASSWORD="${DB_PASSWORD:-$(env_get DB_PASSWORD)}"
+SMTP_PASSWORD="${SMTP_PASSWORD:-$(env_get SMTP_PASSWORD)}"
+SECRET_SRC='generated'; [ -z "$APP_SECRET" ] || SECRET_SRC='kept'
+DBPASS_SRC='generated'; [ -z "$DB_PASSWORD" ] || DBPASS_SRC='kept'
+if [ "$INSTALLED" = 1 ] && [ -n "$(env_get DB_PASSWORD)" ] && [ "$DB_PASSWORD" != "$(env_get DB_PASSWORD)" ]; then
+  warn 'DB_PASSWORD differs from the one in .env - Postgres keeps the old one, the new value is ignored'
+  DB_PASSWORD="$(env_get DB_PASSWORD)"
+fi
+
+#--- Interactive --------------------------------------------------------------
+ANS=''
+ask()    { local a; read -r -p "  $1" a || a=''; ANS="${a:-$2}"; }
+ask_s()  { local a; read -rs -p "  $1" a || a=''; echo; ANS="${a:-$2}"; }
+ask_yn() { local a d="$2" hint='[Y/n]'; [ "$d" = n ] && hint='[y/N]'
+           read -r -p "  $1 $hint " a || a=''
+           case "${a:-$d}" in [Yy]*) ANS=yes ;; *) ANS=no ;; esac; }
+hint()   { echo; note "$1"; }
+
+if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  title 'Questions'
+  note 'press enter to accept the value in brackets'
+
+  hint 'The address people will open. Docmost writes it into links and mails, so it must be the real one, https included.'
+  while :; do
+    ask "Public URL${APP_URL:+ [$APP_URL]}: " "$APP_URL"
+    if valid_url "$ANS"; then APP_URL="${ANS%/}"; break; fi
+    warn 'it must start with http:// or https://'
+  done
+
+  hint 'The port Docmost listens on, on this machine. Your reverse proxy or tunnel points here.'
+  while :; do
+    ask "Port [$PORT]: " "$PORT"
+    if valid_port "$ANS"; then PORT="$ANS"; break; fi
+    warn 'a number from 1 to 65535'
+  done
+
+  if [ -z "$APP_SECRET" ]; then
+    hint 'A long random string that signs sessions and tokens. Leave it empty and one is generated for you.'
+    ask_s 'App secret (hidden, empty = generate): ' ''; APP_SECRET="$ANS"
+    [ -n "$APP_SECRET" ] && SECRET_SRC='yours'
+  fi
+  if [ -z "$DB_PASSWORD" ]; then
+    hint 'The Postgres password, used only between the containers. Leave it empty and one is generated.'
+    ask_s 'Database password (hidden, empty = generate): ' ''; DB_PASSWORD="$ANS"
+    [ -n "$DB_PASSWORD" ] && DBPASS_SRC='yours'
+  fi
+
+  hint 'Docmost sends invitations and password resets by mail. Without a server, they are written to its log instead.'
+  d=n; [ -n "$SMTP_HOST" ] && d=y
+  ask_yn 'Send mail through an SMTP server?' "$d"
+  if [ "$ANS" = yes ]; then
+    ask "  Server${SMTP_HOST:+ [$SMTP_HOST]}: " "$SMTP_HOST"; SMTP_HOST="$ANS"
+    while :; do ask "  Port [$SMTP_PORT]: " "$SMTP_PORT"; if valid_port "$ANS"; then SMTP_PORT="$ANS"; break; fi; warn 'a port number'; done
+    d=n; [ "$SMTP_SECURE" = true ] && d=y
+    ask_yn '  Implicit TLS (usually port 465)?' "$d"; if [ "$ANS" = yes ]; then SMTP_SECURE=true; else SMTP_SECURE=false; fi
+    ask "  User${SMTP_USER:+ [$SMTP_USER]}: " "$SMTP_USER"; SMTP_USER="$ANS"
+    if [ -z "$SMTP_PASSWORD" ]; then ask_s '  Password (hidden): ' ''; SMTP_PASSWORD="$ANS"; else note '  password kept'; fi
+    ask "  Sender address${SMTP_FROM:+ [$SMTP_FROM]}: " "$SMTP_FROM"; SMTP_FROM="$ANS"
+    ask "  Sender name [$SMTP_NAME]: " "$SMTP_NAME"; SMTP_NAME="$ANS"
+  else
+    SMTP_HOST=''
+  fi
+
+  hint 'Where backups go: any folder, and a folder on a NAS mount is the point. The newest stays at the root, older ones move to Old. Change it here any time; backups already made stay where they are.'
+  while :; do
+    ask "Backup folder [$BACKUP_DIR]: " "$BACKUP_DIR"
+    case "$ANS" in /*) BACKUP_DIR="${ANS%/}"; break ;; *) warn 'an absolute path, like /mnt/nas/Backups/Docmost' ;; esac
+  done
+  note "  $(place_text "$BACKUP_DIR")"
+  if looks_unmounted "$BACKUP_DIR"; then warn 'if that was meant to be a NAS, it is not mounted right now: backups would fill the local disk'; fi
+
+  hint 'How many older backups Old keeps before the oldest is deleted. With a backup every 6 hours, 8 means two days back.'
+  while :; do
+    ask "Backups kept in Old [$KEEP]: " "$KEEP"
+    if valid_count "$ANS"; then KEEP="$ANS"; break; fi
+    warn 'a whole number above zero'
+  done
+
+  hint 'How often the backup runs by itself. A run missed because the machine was off happens at the next boot.'
+  while :; do
+    ask "Automatic backup: never, hourly, 2h 3h 4h 6h 8h 12h, daily, weekly [$EVERY]: " "$EVERY"
+    if valid_every "$ANS"; then EVERY="$ANS"; break; fi
+    warn 'one of: never, hourly, 2h, 3h, 4h, 6h, 8h, 12h, daily, weekly'
+  done
+  case "$EVERY" in daily|weekly)
+    while :; do
+      ask "  At what time [$BACKUP_TIME]: " "$BACKUP_TIME"
+      if valid_time "$ANS"; then BACKUP_TIME="$ANS"; break; fi
+      warn 'HH:MM, like 03:30'
+    done ;;
+  esac
+
+  # A fresh install pointed at a folder that already holds backups: the usual
+  # reason is a move to a new machine.
+  if [ "$INSTALLED" = 0 ]; then
+    found="$( { list_dumps "$BACKUP_DIR"; list_dumps "$BACKUP_DIR/Old"; } | awk -F/ 'NF { print $NF }' | sort | tail -1)"
+    if [ -n "$found" ]; then
+      hint "That folder already holds backups, the newest from $(stamp_of "$found"). Restoring it brings back every page, user and file."
+      ask_yn 'Restore it once Docmost is up?' n; RESTORE_LATEST="$ANS"
+    fi
+  fi
+fi
+
+[ -n "$APP_URL" ] || die 'the public URL is required: --url https://docs.example.com'
+if [ -n "$SMTP_HOST" ] && [ -z "$SMTP_FROM" ]; then die 'SMTP needs a sender address: --smtp-from'; fi
+if [ -n "$SMTP_HOST" ] && [ -n "$SMTP_USER" ] && [ -z "$SMTP_PASSWORD" ]; then
+  [ -t 0 ] || die 'set SMTP_PASSWORD in the environment to configure SMTP without a terminal'
+  ask_s 'SMTP password (hidden): ' ''; SMTP_PASSWORD="$ANS"
+fi
+if [ "$RESTORE_LATEST" = yes ] && [ "$INSTALLED" = 1 ]; then
+  warn '--restore-latest is for a fresh install; on this machine use: docmost-setup --restore'
+  RESTORE_LATEST=no
+fi
+# What happens to the timer: written, removed, or nothing to do.
+TIMER_ACTION=none
+if [ "$EVERY" != never ]; then TIMER_ACTION=install
+elif timer_on; then TIMER_ACTION=remove; fi
+if [ "$TIMER_ACTION" != none ] && ! can_sudo; then
+  warn 'no sudo: the automatic backup cannot be changed'
+  TIMER_ACTION=none
+fi
+BACKUP_MOUNT="$(net_mount_of "$BACKUP_DIR")"
+
+#--- To apply -----------------------------------------------------------------
+title 'To apply'
+if [ "$INSTALLED" = 1 ]; then kv docmost "reconfigured in $APP_DIR, data volumes kept"
+else kv docmost "installed in $APP_DIR"; fi
+kv url "$APP_URL, port $PORT"
+kv secrets "app secret $SECRET_SRC, database password $DBPASS_SRC"
+if [ -n "$SMTP_HOST" ]; then
+  s='STARTTLS'; [ "$SMTP_SECURE" = true ] && s='implicit TLS'
+  kv mail "$SMTP_HOST:$SMTP_PORT, $s, from $SMTP_FROM${SMTP_USER:+, user $SMTP_USER}"
+else kv mail 'none, written to the log'; fi
+kv backups "$BACKUP_DIR, $(place_text "$BACKUP_DIR"), $KEEP kept in Old"
+if [ -n "$CUR_BACKUP_DIR" ] && [ "$CUR_BACKUP_DIR" != "$BACKUP_DIR" ]; then
+  kv '' "was $CUR_BACKUP_DIR; backups already there stay there"
+fi
+kv schedule "$(every_text "$EVERY" "$BACKUP_TIME")"
+TOTAL=6
+[ "$TIMER_ACTION" != none ] && TOTAL=$((TOTAL + 1))
+if [ "$RESTORE_LATEST" = yes ]; then kv restore 'the newest backup in that folder, once Docmost is up'; TOTAL=$((TOTAL + 4)); fi
+
+if [ "$DRY_RUN" = 1 ]; then echo; exit 0; fi
+if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  echo; ask_yn "Apply these $TOTAL steps?" y
+  [ "$ANS" = yes ] || { note 'nothing changed'; echo; exit 0; }
+fi
+
+#==============================================================================
+# Apply
+#==============================================================================
+start_log; arm
+
+#--- backups folder -----------------------------------------------------------
+step 'Backup folder'
+mkdir -p "$BACKUP_DIR" 2>/dev/null || $SUDO mkdir -p "$BACKUP_DIR"
+[ -w "$BACKUP_DIR" ] || $SUDO chown "$ME" "$BACKUP_DIR" 2>/dev/null || true
+info "$BACKUP_DIR, $(place_text "$BACKUP_DIR")"
+if looks_unmounted "$BACKUP_DIR"; then flag 'a path under /mnt or /media that sits on the local disk - if it was meant to be a NAS, mount it and run again'; fi
+if touch "$BACKUP_DIR/.w" 2>/dev/null; then
+  rm -f "$BACKUP_DIR/.w"
+  ok "writable, $(plural "$(count_dumps "$BACKUP_DIR")" backup) there"
+else
+  stop 'not writable - backups will fail until the rights on that folder are fixed'
+fi
+
+#--- environment --------------------------------------------------------------
+step 'Environment'
+[ -n "$APP_SECRET" ]  || APP_SECRET="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+[ -n "$DB_PASSWORD" ] || DB_PASSWORD="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+MAIL_DRIVER=log; [ -n "$SMTP_HOST" ] && MAIL_DRIVER=smtp
+umask 077
+cat >"$ENVF" <<EOF
+# Written by docmost-setup. Secrets live here and nowhere else: mode 600.
+APP_URL=$APP_URL
+PORT=$PORT
+APP_SECRET=$APP_SECRET
+DB_PASSWORD=$DB_PASSWORD
+
+MAIL_DRIVER=$MAIL_DRIVER
+SMTP_HOST=$SMTP_HOST
+SMTP_PORT=$SMTP_PORT
+SMTP_USERNAME=$SMTP_USER
+SMTP_PASSWORD=$SMTP_PASSWORD
+SMTP_SECURE=$SMTP_SECURE
+MAIL_FROM_ADDRESS=$SMTP_FROM
+MAIL_FROM_NAME=$SMTP_NAME
+
+# docmost-setup's own settings, read by --backup, --restore and the timer.
+# BACKUP_MOUNT is the network share the folder lives on, empty for a local disk.
+BACKUP_DIR=$BACKUP_DIR
+BACKUP_MOUNT=$BACKUP_MOUNT
+BACKUP_KEEP=$KEEP
+BACKUP_EVERY=$EVERY
+BACKUP_TIME=$BACKUP_TIME
+EOF
+umask 022
+chmod 600 "$ENVF"
+info "$ENVF, mode 600"
+ok "app secret $SECRET_SRC, database password $DBPASS_SRC"
+
+#--- compose ------------------------------------------------------------------
+step 'Compose file'
+cat >"$COMPOSE" <<'EOF'
+# Written by docmost-setup. Settings come from .env next to this file.
+services:
+  docmost:
+    image: docmost/docmost:latest
+    container_name: docmost
+    environment:
+      APP_URL: ${APP_URL}
+      APP_SECRET: ${APP_SECRET}
+      DATABASE_URL: postgresql://docmost:${DB_PASSWORD}@db:5432/docmost?schema=public
+      REDIS_URL: redis://redis:6379
+      MAIL_DRIVER: ${MAIL_DRIVER}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_SECURE: ${SMTP_SECURE}
+      MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME}
+    volumes:
+      - appdata:/app/data/storage
+    networks:
+      - docmost
+    ports:
+      - "${PORT}:3000"
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    container_name: docmost-db
+    environment:
+      POSTGRES_DB: docmost
+      POSTGRES_USER: docmost
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - docmost
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: docmost-redis
+    volumes:
+      - redis_data:/data
+    networks:
+      - docmost
+    restart: unless-stopped
+
+volumes:
+  appdata:
+  db_data:
+  redis_data:
+
+networks:
+  docmost:
+    name: docmost
+EOF
+info "$COMPOSE"
+info "docmost on port $PORT, postgres and redis reachable from the compose network only"
+ok 'written'
+
+#--- validation ---------------------------------------------------------------
+step 'Validation'
+compose config >/dev/null 2>>"$LOG" || fail "compose rejects the configuration - see $LOG"
+# Compose replaces a missing variable with nothing and carries on; make sure
+# the two secrets really made it through.
+for v in APP_SECRET POSTGRES_PASSWORD; do
+  compose config 2>/dev/null | grep -q "$v: .\{8,\}" || fail "$v is empty in the resolved configuration - .env not read?"
+done
+ok 'syntax valid, secrets resolved from .env'
+
+#--- start --------------------------------------------------------------------
+step 'Start'
+busy 'pulling the images' compose pull
+busy 'creating the containers' compose up -d --remove-orphans
+for _ in $(seq 1 30); do pg_ready && break; sleep 1; done
+up="$(compose ps --status running --format '{{.Name}}' 2>/dev/null | wc -l | tr -d ' ' || true)"
+info "$(plural "$up" container) running"
+[ "$(ctn_state docmost-db)" = running ]    || fail 'postgres did not start - docker compose logs db'
+[ "$(ctn_state docmost-redis)" = running ] || fail 'redis did not start - docker compose logs redis'
+[ "$(ctn_state docmost)" = running ]       || fail 'docmost did not start - docker compose logs docmost'
+ok 'docmost, postgres and redis up'
+
+#--- check --------------------------------------------------------------------
+step 'Check'
+code="$(wait_http "$PORT" || true)"
+case "$code" in
+  200|301|302|307|308) ok "http $code on port $PORT" ;;
+  *) stop "http $code on port $PORT - docker compose logs docmost" ;;
+esac
+
+#--- automatic backup ---------------------------------------------------------
+case "$TIMER_ACTION" in
+  install) step 'Automatic backup'; install_timer "$EVERY" "$BACKUP_TIME" "$BACKUP_DIR" ;;
+  remove)  step 'Automatic backup'; remove_timer ;;
+esac
+
+#--- restore on a fresh install -----------------------------------------------
+if [ "$RESTORE_LATEST" = yes ]; then
+  do_restore "$BACKUP_DIR" '' "$PORT" yes
+fi
+
+#==============================================================================
+# Done
+#==============================================================================
+finish
+kv url "$APP_URL"
+kv local "http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT"
+kv backups "$BACKUP_DIR, $(every_text "$EVERY" "$BACKUP_TIME")"
+kv change 'run docmost-setup again: the values in place are the defaults'
+kv log "$LOG"
+echo
